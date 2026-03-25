@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import re
 from datetime import datetime, timezone
 from typing import Optional
@@ -50,7 +53,7 @@ def get_product(product_id: int):
     for product in sample_products:
         if product["product_id"] == product_id:
             return product
-    raise HTTPException(status_code=404, detail="Product not found")
+    return {"error": "Product not found"}
 
 
 @app.get("/products/search")
@@ -87,28 +90,26 @@ SECRET_KEY = "very-secret-key-change-me"
 
 
 # ===== Задания 5.1, 5.2, 5.3 =====
-def _sign_payload(user_id: str, ts: int) -> str:
-    from itsdangerous import Signer
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
 
-    signer = Signer(SECRET_KEY)
-    value = f"{user_id}.{ts}"
-    return signer.sign(value.encode("utf-8")).decode("utf-8")
+
+def _sign_session(user_id: str, ts: int) -> str:
+    msg = f"{user_id}.{ts}".encode("utf-8")
+    sig = hmac.new(SECRET_KEY.encode("utf-8"), msg, hashlib.sha256).digest()
+    return _b64url(sig)
+
+
+def _build_session_token(user_id: str, ts: int) -> str:
+    return f"{user_id}.{ts}.{_sign_session(user_id, ts)}"
 
 
 def _verify_and_parse_session(token: str) -> tuple[str, int]:
-    from itsdangerous import BadSignature, Signer
-
-    signer = Signer(SECRET_KEY)
-    try:
-        unsigned = signer.unsign(token.encode("utf-8")).decode("utf-8")
-    except BadSignature as exc:
-        raise HTTPException(status_code=401, detail={"message": "Invalid session"}) from exc
-
-    parts = unsigned.split(".")
-    if len(parts) != 2:
+    parts = token.split(".")
+    if len(parts) != 3:
         raise HTTPException(status_code=401, detail={"message": "Invalid session"})
 
-    user_id, ts_raw = parts
+    user_id, ts_raw, sig = parts
     try:
         UUID(user_id)
     except ValueError as exc:
@@ -117,11 +118,15 @@ def _verify_and_parse_session(token: str) -> tuple[str, int]:
     if not ts_raw.isdigit():
         raise HTTPException(status_code=401, detail={"message": "Invalid session"})
     ts = int(ts_raw)
+
+    expected = _sign_session(user_id, ts)
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(status_code=401, detail={"message": "Invalid session"})
     return user_id, ts
 
 
 def _set_session_cookie(response: Response, user_id: str, timestamp: int) -> None:
-    signed = _sign_payload(user_id, timestamp)
+    signed = _build_session_token(user_id, timestamp)
     response.set_cookie(
         key=COOKIE_NAME,
         value=signed,
@@ -140,23 +145,29 @@ def login(payload: LoginInput, response: Response):
     now_ts = int(datetime.now(tz=timezone.utc).timestamp())
     _set_session_cookie(response, user["user_id"], now_ts)
 
-    return {
-        "message": "Logged in successfully",
-        "user_id": user["user_id"],
-    }
+    return {"message": "Logged in successfully"}
 
-
-def _get_authorized_user(request: Request, response: Response) -> dict:
+def _get_authorized_user(
+    request: Request,
+    response: Response,
+    *,
+    missing_cookie_message: str,
+    invalid_cookie_message: str,
+    expired_cookie_message: str,
+) -> dict:
     token = request.cookies.get(COOKIE_NAME)
     if not token:
-        raise HTTPException(status_code=401, detail={"message": "Unauthorized"})
+        raise HTTPException(status_code=401, detail={"message": missing_cookie_message})
 
-    user_id, last_activity_ts = _verify_and_parse_session(token)
+    try:
+        user_id, last_activity_ts = _verify_and_parse_session(token)
+    except HTTPException as exc:
+        raise HTTPException(status_code=401, detail={"message": invalid_cookie_message}) from exc
     now_ts = int(datetime.now(tz=timezone.utc).timestamp())
     elapsed = now_ts - last_activity_ts
 
     if elapsed > SESSION_MAX_AGE_SECONDS:
-        raise HTTPException(status_code=401, detail={"message": "Session expired"})
+        raise HTTPException(status_code=401, detail={"message": expired_cookie_message})
 
     if SESSION_REFRESH_THRESHOLD_SECONDS <= elapsed < SESSION_MAX_AGE_SECONDS:
         _set_session_cookie(response, user_id, now_ts)
@@ -169,17 +180,29 @@ def _get_authorized_user(request: Request, response: Response) -> dict:
                 "full_name": data["full_name"],
             }
 
-    raise HTTPException(status_code=401, detail={"message": "Unauthorized"})
+    raise HTTPException(status_code=401, detail={"message": invalid_cookie_message})
 
 
 @app.get("/user")
 def get_user_profile(request: Request, response: Response):
-    return _get_authorized_user(request, response)
+    return _get_authorized_user(
+        request,
+        response,
+        missing_cookie_message="Unauthorized",
+        invalid_cookie_message="Unauthorized",
+        expired_cookie_message="Unauthorized",
+    )
 
 
 @app.get("/profile")
 def get_profile(request: Request, response: Response):
-    return _get_authorized_user(request, response)
+    return _get_authorized_user(
+        request,
+        response,
+        missing_cookie_message="Session expired",
+        invalid_cookie_message="Invalid session",
+        expired_cookie_message="Session expired",
+    )
 
 
 # ===== Задания 5.4, 5.5 =====
@@ -190,7 +213,7 @@ class CommonHeaders(BaseModel):
     @field_validator("accept_language")
     @classmethod
     def validate_accept_language(cls, value: str) -> str:
-        pattern = r"^[a-zA-Z]{2,3}(?:-[a-zA-Z]{2,4})?(?:,\s*[a-zA-Z]{2,3}(?:-[a-zA-Z]{2,4})?(?:;q=(?:0(?:\.\d{1,3})?|1(?:\.0{1,3})?))?)*$"
+        pattern = r"^[a-z]{2}-[A-Z]{2}(,[a-z]{2}-[A-Z]{2}(;q=\d(\.\d+)?)?)*$"
         if not re.match(pattern, value):
             raise ValueError("Invalid Accept-Language format")
         return value
